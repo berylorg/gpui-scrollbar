@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.92"
+version = "0.1.0"
+
+[workspace.dependencies]
+gpui = { git = "https://github.com/berylorg/zed-fork.git", rev = "fabbb607f5aff9e69ef6f09d423c5264bee4c9a8", default-features = false, features = ["windows-manifest"] }
+
+[package]
+name = "gpui-scrollbar"
+description = "Reusable app-neutral scrollbar primitives for GPUI applications."
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/berylorg/gpui-scrollbar"
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "gpui_scrollbar"
+path = "src/lib.rs"
+
+[dependencies]
+gpui.workspace = true
