@@ -68,7 +68,7 @@ fn vertical_lane_pointer_down_dispatches_one_page() {
         },
         || {},
         || {},
-        None,
+        |_, _| {},
     );
 
     let before = dispatch_scrollbar_pointer_down(
@@ -127,7 +127,7 @@ fn horizontal_lane_pointer_down_is_ignored() {
         },
         || {},
         || {},
-        None,
+        |_, _| {},
     );
 
     let before = dispatch_scrollbar_pointer_down(
@@ -166,7 +166,7 @@ fn drag_dispatch_maps_pointer_to_owner_callback_offset() {
         |_, _| {},
         || {},
         || {},
-        None,
+        |_, _| {},
     );
 
     let next = dispatch_scrollbar_drag(

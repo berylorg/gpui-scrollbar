@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
     AnyElement, App, Context, ElementId, MouseButton, Pixels, Point, Render, ScrollHandle, Window,
-    div, prelude::*, px, rgb,
+    canvas, div, prelude::*, px, rgb,
 };
 
 use crate::interaction::{
@@ -10,7 +10,7 @@ use crate::interaction::{
     dispatch_scrollbar_pointer_down, scrollbar_axis_length, scrollbar_axis_max_offset,
     scrollbar_axis_scroll_offset,
 };
-use crate::{Axis, ScrollbarActivityCallback, ScrollbarMetrics, ScrollbarStyle, scrollbar_metrics};
+use crate::{Axis, ScrollbarMetrics, ScrollbarStyle, ScrollbarVisibilityPolicy, scrollbar_metrics};
 
 /// Renders an interactive scrollbar backed by an ordinary [`ScrollHandle`].
 #[must_use]
@@ -19,12 +19,10 @@ pub fn render_scroll_handle_scrollbar(
     scroll_handle: &ScrollHandle,
     axis: Axis,
     style: ScrollbarStyle,
-    opacity: f32,
-    on_activity: Option<ScrollbarActivityCallback>,
+    visibility: ScrollbarVisibilityPolicy,
 ) -> Option<AnyElement> {
-    let interaction =
-        ScrollbarInteraction::for_scroll_handle(scroll_handle.clone(), axis, on_activity);
-    render_scrollbar(id, axis, style, opacity, interaction)
+    let interaction = ScrollbarInteraction::for_scroll_handle(scroll_handle.clone(), axis);
+    render_scrollbar(id, axis, style, visibility, interaction)
 }
 
 /// Renders an interactive scrollbar backed by caller-owned scroll callbacks.
@@ -33,13 +31,9 @@ pub fn render_scrollbar(
     id: impl Into<ElementId>,
     axis: Axis,
     style: ScrollbarStyle,
-    opacity: f32,
+    visibility: ScrollbarVisibilityPolicy,
     interaction: ScrollbarInteraction,
 ) -> Option<AnyElement> {
-    if opacity <= 0.0 {
-        return None;
-    }
-
     let style = style.normalized();
     let state = interaction.current_state()?;
     let viewport_length = scrollbar_axis_length(axis, state.viewport_bounds.size);
@@ -52,6 +46,12 @@ pub fn render_scrollbar(
         overflow_length,
         scroll_offset,
     )?;
+    let drives_animation_frames = visibility.should_request_animation_frame_for_overflow(true);
+    let opacity = match visibility.opacity_for_overflow(true) {
+        Some(opacity) => opacity,
+        None if drives_animation_frames => 0.0,
+        None => return None,
+    };
 
     Some(render_scrollbar_with_metrics(
         id.into(),
@@ -59,6 +59,8 @@ pub fn render_scrollbar(
         metrics,
         style,
         opacity,
+        drives_animation_frames,
+        visibility,
         interaction,
     ))
 }
@@ -69,6 +71,8 @@ fn render_scrollbar_with_metrics(
     metrics: ScrollbarMetrics,
     style: ScrollbarStyle,
     opacity: f32,
+    drives_animation_frames: bool,
+    visibility: ScrollbarVisibilityPolicy,
     interaction: ScrollbarInteraction,
 ) -> AnyElement {
     let pending_drag = Rc::new(RefCell::new(None));
@@ -90,23 +94,29 @@ fn render_scrollbar_with_metrics(
     }
     .id(id)
     .child(thumb);
+    if drives_animation_frames {
+        lane = lane.child(render_animation_frame_driver(visibility.clone()));
+    }
 
     let drag_value = ScrollbarDragValue {
         axis,
         style,
         interaction: interaction.clone(),
+        visibility: visibility.clone(),
         pending_drag: pending_drag.clone(),
         active_drag: active_drag.clone(),
     };
     lane = lane
         .on_mouse_down(MouseButton::Left, {
             let interaction = interaction.clone();
+            let visibility = visibility.clone();
             let pending_drag = pending_drag.clone();
             move |event, window, cx| {
                 handle_scrollbar_mouse_down(
                     axis,
                     style,
                     &interaction,
+                    &visibility,
                     &pending_drag,
                     event.position,
                     window,
@@ -121,12 +131,13 @@ fn render_scrollbar_with_metrics(
         })
         .on_drag_move::<ScrollbarDragValue>(
             move |event: &gpui::DragMoveEvent<ScrollbarDragValue>, window, cx| {
-                let (axis, style, interaction, active_drag) = {
+                let (axis, style, interaction, visibility, active_drag) = {
                     let drag = event.drag(cx);
                     (
                         drag.axis,
                         drag.style,
                         drag.interaction.clone(),
+                        drag.visibility.clone(),
                         drag.active_drag.clone(),
                     )
                 };
@@ -134,6 +145,7 @@ fn render_scrollbar_with_metrics(
                     axis,
                     style,
                     &interaction,
+                    &visibility,
                     &active_drag,
                     event.event.position,
                     window,
@@ -144,6 +156,21 @@ fn render_scrollbar_with_metrics(
         );
 
     lane.into_any_element()
+}
+
+fn render_animation_frame_driver(visibility: ScrollbarVisibilityPolicy) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            visibility.request_animation_frame_for_overflow(true, window);
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .w(px(0.0))
+    .h(px(0.0))
+    .into_any_element()
 }
 
 /// Renders a non-interactive scrollbar thumb.
@@ -194,6 +221,7 @@ struct ScrollbarDragValue {
     axis: Axis,
     style: ScrollbarStyle,
     interaction: ScrollbarInteraction,
+    visibility: ScrollbarVisibilityPolicy,
     pending_drag: Rc<RefCell<Option<PendingScrollbarDrag>>>,
     active_drag: Rc<RefCell<Option<ScrollbarActiveDrag>>>,
 }
@@ -212,7 +240,7 @@ impl ScrollbarDragValue {
 
         self.interaction.drag_started();
         *self.active_drag.borrow_mut() = Some(ScrollbarActiveDrag { grab_offset });
-        self.interaction.record_activity(window, cx);
+        self.visibility.begin_direct_interaction(window, cx);
     }
 
     fn thumb_grab_offset_at(&self, pointer_position: Point<Pixels>) -> Option<Pixels> {
@@ -228,6 +256,7 @@ impl Drop for ScrollbarDragValue {
     fn drop(&mut self) {
         if self.active_drag.borrow_mut().take().is_some() {
             self.interaction.drag_ended();
+            self.visibility.end_direct_interaction();
         }
     }
 }
@@ -236,6 +265,7 @@ fn update_scrollbar_drag(
     axis: Axis,
     style: ScrollbarStyle,
     interaction: &ScrollbarInteraction,
+    visibility: &ScrollbarVisibilityPolicy,
     active_drag: &Rc<RefCell<Option<ScrollbarActiveDrag>>>,
     pointer_position: Point<Pixels>,
     window: &mut Window,
@@ -253,7 +283,8 @@ fn update_scrollbar_drag(
     )
     .is_some()
     {
-        interaction.record_activity(window, cx);
+        interaction.owner_updated(window, cx);
+        visibility.record_direct_activity(window, cx);
     }
 }
 
@@ -269,6 +300,7 @@ fn handle_scrollbar_mouse_down(
     axis: Axis,
     style: ScrollbarStyle,
     interaction: &ScrollbarInteraction,
+    visibility: &ScrollbarVisibilityPolicy,
     pending_drag: &Rc<RefCell<Option<PendingScrollbarDrag>>>,
     position: Point<Pixels>,
     window: &mut Window,
@@ -280,7 +312,8 @@ fn handle_scrollbar_mouse_down(
         }
         ScrollbarPointerDownAction::Page { .. } => {
             *pending_drag.borrow_mut() = Some(PendingScrollbarDrag::Ignore);
-            interaction.record_activity(window, cx);
+            interaction.owner_updated(window, cx);
+            visibility.record_direct_activity(window, cx);
         }
         ScrollbarPointerDownAction::Ignore => {
             *pending_drag.borrow_mut() = Some(PendingScrollbarDrag::Ignore);

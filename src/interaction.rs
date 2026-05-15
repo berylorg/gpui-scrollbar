@@ -22,8 +22,8 @@ pub struct ScrollbarScrollState {
     pub scroll_offset: Point<Pixels>,
 }
 
-/// Callback invoked when scrollbar chrome activity should wake application UI.
-pub type ScrollbarActivityCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+/// Callback invoked after scrollbar chrome requested caller-owned scrolling.
+pub type ScrollbarOwnerUpdateCallback = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Caller-owned scroll callbacks used by rendered scrollbar chrome.
 #[derive(Clone)]
@@ -33,7 +33,7 @@ pub struct ScrollbarInteraction {
     page_scroll: Rc<dyn Fn(ScrollDirection, Pixels)>,
     drag_started: Rc<dyn Fn()>,
     drag_ended: Rc<dyn Fn()>,
-    on_activity: Option<ScrollbarActivityCallback>,
+    on_owner_update: ScrollbarOwnerUpdateCallback,
 }
 
 impl ScrollbarInteraction {
@@ -44,7 +44,7 @@ impl ScrollbarInteraction {
         page_scroll: impl Fn(ScrollDirection, Pixels) + 'static,
         drag_started: impl Fn() + 'static,
         drag_ended: impl Fn() + 'static,
-        on_activity: Option<ScrollbarActivityCallback>,
+        on_owner_update: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             state: Rc::new(state),
@@ -52,16 +52,23 @@ impl ScrollbarInteraction {
             page_scroll: Rc::new(page_scroll),
             drag_started: Rc::new(drag_started),
             drag_ended: Rc::new(drag_ended),
-            on_activity,
+            on_owner_update: Rc::new(on_owner_update),
         }
     }
 
     /// Creates a scrollbar interaction for an ordinary [`ScrollHandle`].
     #[must_use]
-    pub fn for_scroll_handle(
+    pub fn for_scroll_handle(scroll_handle: ScrollHandle, axis: Axis) -> Self {
+        Self::for_scroll_handle_with_owner_update(scroll_handle, axis, |_, _| {})
+    }
+
+    /// Creates a scrollbar interaction for an ordinary [`ScrollHandle`] with an
+    /// owner callback invoked after scrollbar chrome requested scrolling.
+    #[must_use]
+    pub fn for_scroll_handle_with_owner_update(
         scroll_handle: ScrollHandle,
         axis: Axis,
-        on_activity: Option<ScrollbarActivityCallback>,
+        on_owner_update: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         Self::new(
             {
@@ -114,7 +121,7 @@ impl ScrollbarInteraction {
             },
             || {},
             || {},
-            on_activity,
+            on_owner_update,
         )
     }
 
@@ -144,12 +151,9 @@ impl ScrollbarInteraction {
         (self.drag_ended)();
     }
 
-    /// Records scrollbar chrome activity and refreshes the window.
-    pub fn record_activity(&self, window: &mut Window, cx: &mut App) {
-        if let Some(on_activity) = self.on_activity.as_ref() {
-            on_activity(window, cx);
-        }
-        window.refresh();
+    /// Notifies the owner after scrollbar chrome requested scrolling.
+    pub fn owner_updated(&self, window: &mut Window, cx: &mut App) {
+        (self.on_owner_update)(window, cx);
     }
 }
 

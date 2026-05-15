@@ -1,17 +1,22 @@
 #![forbid(unsafe_code)]
 //! App-neutral scrollbar primitives for `gpui` applications.
 //!
-//! The crate owns reusable scrollbar concepts and later provides the shared
-//! geometry, rendering, and pointer direct-manipulation behavior. Callers keep
-//! ownership of scroll state, focus routing, keyboard input, wheel routing,
-//! visibility policy, and application-specific edge rules.
+//! The crate owns reusable scrollbar concepts and provides shared geometry,
+//! rendering, managed chrome visibility, and pointer direct-manipulation
+//! behavior. Callers keep ownership of scroll state, focus routing, keyboard
+//! input, wheel routing, and application-specific edge rules.
+//! Ordinary scrollbar render helpers also drive managed fade animation frames
+//! while opacity transitions are active, so callers only report viewport
+//! activity and retain per-region visibility state.
 //!
 //! ```
 //! use gpui::{Bounds, point, px, size};
 //! use gpui_scrollbar::{
 //!     Axis, LaneClick, ScrollDirection, ScrollbarGeometryStyle, ScrollbarPointerDownAction,
-//!     ScrollbarScrollState, ScrollbarStyle, scrollbar_metrics, scrollbar_pointer_down_action,
+//!     ScrollbarScrollState, ScrollbarStyle, ScrollbarVisibilityPolicy,
+//!     ScrollbarVisibilityState, scrollbar_metrics, scrollbar_pointer_down_action,
 //! };
+//! use std::rc::Rc;
 //!
 //! assert!(Axis::Vertical.is_vertical());
 //! assert_eq!(LaneClick::AfterThumb.page_direction(), ScrollDirection::Forward);
@@ -36,12 +41,21 @@
 //!     point(px(236.0), px(230.0)),
 //! );
 //! assert!(matches!(action, ScrollbarPointerDownAction::Page { .. }));
+//!
+//! let visibility_state = ScrollbarVisibilityState::new();
+//! let managed = visibility_state.managed(Rc::new(|_, _| {}));
+//! assert_eq!(managed.opacity_for_overflow(true), None);
+//! assert_eq!(
+//!     ScrollbarVisibilityPolicy::always_visible().opacity_for_overflow(true),
+//!     Some(1.0),
+//! );
 //! ```
 
 mod geometry;
 mod interaction;
 mod render;
 mod style;
+mod visibility;
 
 pub use geometry::{
     ScrollbarAxisHit, ScrollbarGeometryStyle, ScrollbarMetrics, ScrollbarTrackGeometry,
@@ -49,12 +63,16 @@ pub use geometry::{
     scrollbar_thumb_grab_offset, scrollbar_track_geometry,
 };
 pub use interaction::{
-    ScrollbarActivityCallback, ScrollbarInteraction, ScrollbarPointerDownAction,
+    ScrollbarInteraction, ScrollbarOwnerUpdateCallback, ScrollbarPointerDownAction,
     ScrollbarScrollState, dispatch_scrollbar_drag, dispatch_scrollbar_pointer_down,
     scrollbar_drag_scroll_offset, scrollbar_pointer_down_action,
 };
 pub use render::{render_scroll_handle_scrollbar, render_scrollbar, render_scrollbar_thumb};
 pub use style::ScrollbarStyle;
+pub use visibility::{
+    ManagedScrollbarVisibility, ScrollbarFadeConfig, ScrollbarVisibilityPolicy,
+    ScrollbarVisibilityState, ScrollbarVisibilityUpdateCallback,
+};
 
 /// The visual and movement orientation of a scrollbar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

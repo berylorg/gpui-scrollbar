@@ -1,4 +1,4 @@
-use gpui_scrollbar::{Axis, LaneClick, ScrollDirection};
+use gpui_scrollbar::{Axis, LaneClick, ScrollDirection, ScrollbarVisibilityPolicy};
 
 #[test]
 fn axis_helpers_identify_orientation() {
@@ -18,4 +18,12 @@ fn lane_clicks_map_to_page_directions() {
         LaneClick::AfterThumb.page_direction(),
         ScrollDirection::Forward
     );
+}
+
+#[test]
+fn always_visible_policy_requires_overflow() {
+    let policy = ScrollbarVisibilityPolicy::always_visible();
+
+    assert_eq!(policy.opacity_for_overflow(true), Some(1.0));
+    assert_eq!(policy.opacity_for_overflow(false), None);
 }
