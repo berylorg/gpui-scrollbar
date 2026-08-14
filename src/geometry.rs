@@ -1,4 +1,6 @@
-use gpui::{Pixels, px};
+use gpui::{Bounds, Pixels, Point, Size, px};
+
+use crate::{Axis, ScrollbarOwnerKey};
 
 /// App-neutral geometry constants used by scrollbar math.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,6 +62,82 @@ pub struct ScrollbarTrackGeometry {
     pub thumb_end: Pixels,
 }
 
+/// Current exact geometry supplied by the caller-owned scroll model.
+///
+/// Offsets use positive visible scroll distances. Content and page distances
+/// are supplied per axis so the same state can back either scrollbar axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarScrollState {
+    /// Exact owner-and-mount identity for this state.
+    pub owner: ScrollbarOwnerKey,
+    /// Viewport bounds in window coordinates.
+    pub viewport_bounds: Bounds<Pixels>,
+    /// Exact content size measured by the owner.
+    pub content_size: Size<Pixels>,
+    /// Current positive visible scroll distance for each axis.
+    pub scroll_offset: Point<Pixels>,
+    /// Positive page distance for each axis.
+    pub page_distance: Size<Pixels>,
+}
+
+/// Closed bounds along one scrollbar axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarAxisBounds {
+    /// Bound nearest the start of the viewport.
+    pub start: Pixels,
+    /// Bound nearest the end of the viewport.
+    pub end: Pixels,
+}
+
+/// One exact, owner-keyed geometry record used for a pointer interaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarGeometrySnapshot {
+    /// Exact owner-and-mount identity that published the geometry.
+    pub owner: ScrollbarOwnerKey,
+    /// Scrollbar axis represented by this record.
+    pub axis: Axis,
+    /// Viewport start in window coordinates along the axis.
+    pub viewport_start: Pixels,
+    /// Positive viewport length along the axis.
+    pub viewport_length: Pixels,
+    /// Exact content length along the axis.
+    pub content_length: Pixels,
+    /// Current positive scroll offset, clamped to the exact overflow.
+    pub scroll_offset: Pixels,
+    /// Track bounds relative to the viewport start.
+    pub track_bounds: ScrollbarAxisBounds,
+    /// Thumb bounds relative to the viewport start.
+    pub thumb_bounds: ScrollbarAxisBounds,
+    /// Positive owner-supplied page distance for this snapshot.
+    pub page_distance: Pixels,
+}
+
+impl ScrollbarGeometrySnapshot {
+    /// Returns the exact positive overflow length.
+    #[must_use]
+    pub fn overflow_length(self) -> Pixels {
+        (self.content_length - self.viewport_length).max(px(0.0))
+    }
+
+    /// Converts a window position into a position relative to this viewport.
+    #[must_use]
+    pub fn axis_position(self, position: Point<Pixels>) -> Pixels {
+        (match self.axis {
+            Axis::Horizontal => position.x,
+            Axis::Vertical => position.y,
+        }) - self.viewport_start
+    }
+
+    /// Returns thumb metrics represented by this exact snapshot.
+    #[must_use]
+    pub fn metrics(self) -> ScrollbarMetrics {
+        ScrollbarMetrics {
+            thumb_offset: self.thumb_bounds.start - self.track_bounds.start,
+            thumb_length: self.thumb_bounds.end - self.thumb_bounds.start,
+        }
+    }
+}
+
 /// Computes visible scrollbar thumb metrics for a viewport and overflow amount.
 ///
 /// Returns `None` when the viewport is empty, when there is no overflow, or
@@ -112,6 +190,46 @@ pub fn scrollbar_track_geometry(
     })
 }
 
+/// Builds the one exact geometry record used by rendering and pointer input.
+///
+/// Returns `None` when no scrollbar thumb can be represented or when the
+/// owner-supplied page distance is not positive.
+#[must_use]
+pub fn scrollbar_geometry_snapshot(
+    axis: Axis,
+    style: ScrollbarGeometryStyle,
+    state: ScrollbarScrollState,
+) -> Option<ScrollbarGeometrySnapshot> {
+    let viewport_length = axis_length(axis, state.viewport_bounds.size);
+    let content_length = axis_length(axis, state.content_size).max(px(0.0));
+    let overflow_length = (content_length - viewport_length).max(px(0.0));
+    let scroll_offset = axis_position(axis, state.scroll_offset).clamp(px(0.0), overflow_length);
+    let page_distance = axis_length(axis, state.page_distance);
+    if page_distance <= px(0.0) {
+        return None;
+    }
+
+    let metrics = scrollbar_metrics(style, viewport_length, overflow_length, scroll_offset)?;
+    let geometry = scrollbar_track_geometry(style, viewport_length, metrics)?;
+    Some(ScrollbarGeometrySnapshot {
+        owner: state.owner,
+        axis,
+        viewport_start: axis_position(axis, state.viewport_bounds.origin),
+        viewport_length,
+        content_length,
+        scroll_offset,
+        track_bounds: ScrollbarAxisBounds {
+            start: geometry.track_start,
+            end: geometry.track_start + geometry.track_length,
+        },
+        thumb_bounds: ScrollbarAxisBounds {
+            start: geometry.thumb_start,
+            end: geometry.thumb_end,
+        },
+        page_distance,
+    })
+}
+
 /// Classifies a pointer position along the scrollbar axis.
 #[must_use]
 pub fn classify_scrollbar_axis_hit(
@@ -161,4 +279,18 @@ pub fn scroll_offset_from_thumb_drag(
     let desired_thumb_offset = (pointer_axis_position - geometry.track_start - thumb_grab_offset)
         .clamp(px(0.0), thumb_travel);
     Some(overflow_length * (desired_thumb_offset / thumb_travel))
+}
+
+pub(crate) fn axis_length(axis: Axis, size: Size<Pixels>) -> Pixels {
+    match axis {
+        Axis::Horizontal => size.width,
+        Axis::Vertical => size.height,
+    }
+}
+
+pub(crate) fn axis_position(axis: Axis, position: Point<Pixels>) -> Pixels {
+    match axis {
+        Axis::Horizontal => position.x,
+        Axis::Vertical => position.y,
+    }
 }

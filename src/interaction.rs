@@ -1,52 +1,63 @@
 use std::rc::Rc;
 
-use gpui::{App, Bounds, Pixels, Point, ScrollHandle, Size, Window, point, px};
+use gpui::{App, Pixels, Point, ScrollHandle, Window, point, px};
 
 use crate::{
-    Axis, LaneClick, ScrollDirection, ScrollbarAxisHit, ScrollbarStyle,
-    classify_scrollbar_axis_hit, scroll_offset_from_thumb_drag, scrollbar_metrics,
-    scrollbar_thumb_grab_offset,
+    Axis, LaneClick, ScrollDirection, ScrollbarAxisHit, ScrollbarGeometrySnapshot,
+    ScrollbarOwnerKey, ScrollbarScrollState, ScrollbarStyle, scrollbar_geometry_snapshot,
 };
 
-/// Current scroll geometry supplied by the scrollable owner.
-///
-/// `scroll_offset` is a positive visible scroll distance. The helper for
-/// [`ScrollHandle`] converts from GPUI's negative content offset convention.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ScrollbarScrollState {
-    /// Viewport bounds in window coordinates.
-    pub viewport_bounds: Bounds<Pixels>,
-    /// Maximum positive scroll distance for each axis.
-    pub max_offset: Size<Pixels>,
-    /// Current positive visible scroll distance for each axis.
-    pub scroll_offset: Point<Pixels>,
-}
-
-/// Callback invoked after scrollbar chrome requested caller-owned scrolling.
-pub type ScrollbarOwnerUpdateCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+/// Callback invoked after keyed scrollbar chrome mutated caller-owned state.
+pub type ScrollbarOwnerUpdateCallback =
+    Rc<dyn Fn(ScrollbarGeometrySnapshot, &mut Window, &mut App)>;
 
 /// Caller-owned scroll callbacks used by rendered scrollbar chrome.
+///
+/// Every mutation callback receives the exact geometry snapshot validated
+/// immediately before it was invoked.
 #[derive(Clone)]
 pub struct ScrollbarInteraction {
+    identity: ScrollbarInteractionIdentity,
     state: Rc<dyn Fn() -> Option<ScrollbarScrollState>>,
-    set_scroll_offset: Rc<dyn Fn(Pixels)>,
-    page_scroll: Rc<dyn Fn(ScrollDirection, Pixels)>,
-    drag_started: Rc<dyn Fn()>,
-    drag_ended: Rc<dyn Fn()>,
+    set_scroll_offset: Rc<dyn Fn(ScrollbarGeometrySnapshot, Pixels)>,
+    page_scroll: Rc<dyn Fn(ScrollbarGeometrySnapshot, ScrollDirection, Pixels)>,
+    drag_started: Rc<dyn Fn(ScrollbarGeometrySnapshot)>,
+    drag_ended: Rc<dyn Fn(ScrollbarGeometrySnapshot)>,
     on_owner_update: ScrollbarOwnerUpdateCallback,
 }
 
+#[derive(Clone)]
+enum ScrollbarInteractionIdentity {
+    Callback(Rc<()>),
+    ScrollHandle(ScrollHandle),
+}
+
 impl ScrollbarInteraction {
-    /// Creates a callback-backed scrollbar interaction for caller-owned scroll models.
+    pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
+        match (&self.identity, &other.identity) {
+            (
+                ScrollbarInteractionIdentity::Callback(left),
+                ScrollbarInteractionIdentity::Callback(right),
+            ) => Rc::ptr_eq(left, right),
+            (
+                ScrollbarInteractionIdentity::ScrollHandle(left),
+                ScrollbarInteractionIdentity::ScrollHandle(right),
+            ) => left.ptr_eq(right),
+            _ => false,
+        }
+    }
+
+    /// Creates an exact keyed interaction for a caller-owned scroll model.
     pub fn new(
         state: impl Fn() -> Option<ScrollbarScrollState> + 'static,
-        set_scroll_offset: impl Fn(Pixels) + 'static,
-        page_scroll: impl Fn(ScrollDirection, Pixels) + 'static,
-        drag_started: impl Fn() + 'static,
-        drag_ended: impl Fn() + 'static,
-        on_owner_update: impl Fn(&mut Window, &mut App) + 'static,
+        set_scroll_offset: impl Fn(ScrollbarGeometrySnapshot, Pixels) + 'static,
+        page_scroll: impl Fn(ScrollbarGeometrySnapshot, ScrollDirection, Pixels) + 'static,
+        drag_started: impl Fn(ScrollbarGeometrySnapshot) + 'static,
+        drag_ended: impl Fn(ScrollbarGeometrySnapshot) + 'static,
+        on_owner_update: impl Fn(ScrollbarGeometrySnapshot, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
+            identity: ScrollbarInteractionIdentity::Callback(Rc::new(())),
             state: Rc::new(state),
             set_scroll_offset: Rc::new(set_scroll_offset),
             page_scroll: Rc::new(page_scroll),
@@ -56,40 +67,47 @@ impl ScrollbarInteraction {
         }
     }
 
-    /// Creates a scrollbar interaction for an ordinary [`ScrollHandle`].
+    /// Creates an exact keyed interaction for an ordinary [`ScrollHandle`].
     #[must_use]
-    pub fn for_scroll_handle(scroll_handle: ScrollHandle, axis: Axis) -> Self {
-        Self::for_scroll_handle_with_owner_update(scroll_handle, axis, |_, _| {})
-    }
-
-    /// Creates a scrollbar interaction for an ordinary [`ScrollHandle`] with an
-    /// owner callback invoked after scrollbar chrome requested scrolling.
-    #[must_use]
-    pub fn for_scroll_handle_with_owner_update(
+    pub fn for_scroll_handle(
+        owner: ScrollbarOwnerKey,
         scroll_handle: ScrollHandle,
         axis: Axis,
-        on_owner_update: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
-        Self::new(
+        Self::for_scroll_handle_with_owner_update(owner, scroll_handle, axis, |_, _, _| {})
+    }
+
+    /// Creates a keyed scroll-handle interaction with an owner update callback.
+    #[must_use]
+    pub fn for_scroll_handle_with_owner_update(
+        owner: ScrollbarOwnerKey,
+        scroll_handle: ScrollHandle,
+        axis: Axis,
+        on_owner_update: impl Fn(ScrollbarGeometrySnapshot, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        let mut interaction = Self::new(
             {
                 let scroll_handle = scroll_handle.clone();
                 move || {
+                    let viewport_bounds = scroll_handle.bounds();
                     let max_offset = scroll_handle.max_offset();
                     let offset = scroll_handle.offset();
                     Some(ScrollbarScrollState {
-                        viewport_bounds: scroll_handle.bounds(),
-                        max_offset,
+                        owner,
+                        viewport_bounds,
+                        content_size: viewport_bounds.size + max_offset,
                         scroll_offset: point(
                             (-offset.x).clamp(px(0.0), max_offset.width.max(px(0.0))),
                             (-offset.y).clamp(px(0.0), max_offset.height.max(px(0.0))),
                         ),
+                        page_distance: viewport_bounds.size,
                     })
                 }
             },
             {
                 let scroll_handle = scroll_handle.clone();
-                move |scroll_offset| {
-                    let max_offset = scrollbar_axis_max_offset(axis, scroll_handle.max_offset());
+                move |_, scroll_offset| {
+                    let max_offset = axis_size(axis, scroll_handle.max_offset());
                     let scroll_offset = scroll_offset.clamp(px(0.0), max_offset);
                     let current_offset = scroll_handle.offset();
                     scroll_handle.set_offset(match axis {
@@ -100,14 +118,14 @@ impl ScrollbarInteraction {
             },
             {
                 let scroll_handle = scroll_handle.clone();
-                move |direction, distance| {
+                move |_, direction, distance| {
                     let distance = distance.max(px(0.0));
                     let current_offset = scroll_handle.offset();
                     let current_scroll_offset = match axis {
                         Axis::Horizontal => -current_offset.x,
                         Axis::Vertical => -current_offset.y,
                     };
-                    let max_offset = scrollbar_axis_max_offset(axis, scroll_handle.max_offset());
+                    let max_offset = axis_size(axis, scroll_handle.max_offset());
                     let next_scroll_offset = match direction {
                         ScrollDirection::Backward => current_scroll_offset - distance,
                         ScrollDirection::Forward => current_scroll_offset + distance,
@@ -119,215 +137,205 @@ impl ScrollbarInteraction {
                     });
                 }
             },
-            || {},
-            || {},
+            |_| {},
+            |_| {},
             on_owner_update,
-        )
+        );
+        interaction.identity = ScrollbarInteractionIdentity::ScrollHandle(scroll_handle);
+        interaction
     }
 
-    /// Returns the current caller-owned scroll state.
+    /// Returns the current exact geometry record for an axis and style.
     #[must_use]
-    pub fn current_state(&self) -> Option<ScrollbarScrollState> {
-        (self.state)()
+    pub fn current_snapshot(
+        &self,
+        axis: Axis,
+        style: ScrollbarStyle,
+    ) -> Option<ScrollbarGeometrySnapshot> {
+        scrollbar_geometry_snapshot(axis, style.normalized().geometry, (self.state)()?)
     }
 
-    /// Sets the positive scroll offset along the scrollbar axis.
-    pub fn set_scroll_offset(&self, offset: Pixels) {
-        (self.set_scroll_offset)(offset);
+    pub(crate) fn snapshot_is_current(
+        &self,
+        expected: ScrollbarGeometrySnapshot,
+        style: ScrollbarStyle,
+    ) -> bool {
+        self.current_snapshot(expected.axis, style) == Some(expected)
     }
 
-    /// Requests one page scroll in the given direction.
-    pub fn page_scroll(&self, direction: ScrollDirection, distance: Pixels) {
-        (self.page_scroll)(direction, distance);
+    pub(crate) fn start_drag(
+        &self,
+        expected: ScrollbarGeometrySnapshot,
+        style: ScrollbarStyle,
+    ) -> bool {
+        if !self.snapshot_is_current(expected, style) {
+            return false;
+        }
+        (self.drag_started)(expected);
+        true
     }
 
-    /// Notifies the owner that thumb dragging started.
-    pub fn drag_started(&self) {
-        (self.drag_started)();
+    pub(crate) fn end_drag_authorized(&self, snapshot: ScrollbarGeometrySnapshot) {
+        (self.drag_ended)(snapshot);
     }
 
-    /// Notifies the owner that thumb dragging ended.
-    pub fn drag_ended(&self) {
-        (self.drag_ended)();
+    pub(crate) fn current_owner_update(
+        &self,
+        expected: ScrollbarGeometrySnapshot,
+        style: ScrollbarStyle,
+    ) -> Option<ScrollbarGeometrySnapshot> {
+        let Some(current) = self.current_snapshot(expected.axis, style) else {
+            return None;
+        };
+        (current.owner == expected.owner).then_some(current)
     }
 
-    /// Notifies the owner after scrollbar chrome requested scrolling.
-    pub fn owner_updated(&self, window: &mut Window, cx: &mut App) {
-        (self.on_owner_update)(window, cx);
+    pub(crate) fn owner_updated(
+        &self,
+        current: ScrollbarGeometrySnapshot,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        (self.on_owner_update)(current, window, cx);
     }
 }
 
-/// Testable action derived from a pointer down inside the scrollbar lane.
+/// Testable action derived from a pointer down inside one exact snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollbarPointerDownAction {
     /// The pointer landed on the thumb and can begin dragging.
     StartDrag {
+        /// Exact hit-tested geometry record.
+        snapshot: ScrollbarGeometrySnapshot,
         /// Pointer offset from the thumb start, clamped to the thumb length.
         grab_offset: Pixels,
     },
     /// The pointer landed in a vertical lane outside the thumb.
     Page {
+        /// Exact hit-tested geometry record.
+        snapshot: ScrollbarGeometrySnapshot,
         /// Lane area that was clicked.
         lane: LaneClick,
         /// Page-scroll direction the owner should apply.
         direction: ScrollDirection,
-        /// Page-scroll distance, equal to the viewport length on the axis.
+        /// Positive page distance from the same snapshot.
         distance: Pixels,
     },
     /// The pointer does not produce scrollbar-owned scroll activity.
     Ignore,
 }
 
-/// Returns the scrollbar action for a pointer down without invoking callbacks.
+/// Returns the scrollbar action for a pointer down on one exact snapshot.
 #[must_use]
 pub fn scrollbar_pointer_down_action(
-    axis: Axis,
-    style: ScrollbarStyle,
-    state: ScrollbarScrollState,
+    snapshot: ScrollbarGeometrySnapshot,
     pointer_position: Point<Pixels>,
 ) -> ScrollbarPointerDownAction {
-    let style = style.normalized();
-    let viewport_length = scrollbar_axis_length(axis, state.viewport_bounds.size);
-    let overflow_length = scrollbar_axis_max_offset(axis, state.max_offset);
-    let scroll_offset =
-        scrollbar_axis_scroll_offset(axis, state.scroll_offset).clamp(px(0.0), overflow_length);
-    let Some(metrics) = scrollbar_metrics(
-        style.geometry,
-        viewport_length,
-        overflow_length,
-        scroll_offset,
-    ) else {
-        return ScrollbarPointerDownAction::Ignore;
+    let axis_position = snapshot.axis_position(pointer_position);
+    let hit = if axis_position < snapshot.thumb_bounds.start {
+        ScrollbarAxisHit::LaneBeforeThumb
+    } else if axis_position <= snapshot.thumb_bounds.end {
+        ScrollbarAxisHit::Thumb
+    } else {
+        ScrollbarAxisHit::LaneAfterThumb
     };
-    let axis_position =
-        scrollbar_axis_position_in_viewport(axis, pointer_position, state.viewport_bounds);
 
-    match classify_scrollbar_axis_hit(style.geometry, viewport_length, metrics, axis_position) {
-        Some(ScrollbarAxisHit::Thumb) => {
-            scrollbar_thumb_grab_offset(style.geometry, viewport_length, metrics, axis_position)
-                .map(|grab_offset| ScrollbarPointerDownAction::StartDrag { grab_offset })
-                .unwrap_or(ScrollbarPointerDownAction::Ignore)
+    match hit {
+        ScrollbarAxisHit::Thumb => ScrollbarPointerDownAction::StartDrag {
+            snapshot,
+            grab_offset: (axis_position - snapshot.thumb_bounds.start).clamp(
+                px(0.0),
+                snapshot.thumb_bounds.end - snapshot.thumb_bounds.start,
+            ),
+        },
+        ScrollbarAxisHit::LaneBeforeThumb if snapshot.axis == Axis::Vertical => {
+            page_action(snapshot, LaneClick::BeforeThumb)
         }
-        Some(ScrollbarAxisHit::LaneBeforeThumb) if axis == Axis::Vertical => {
-            let lane = LaneClick::BeforeThumb;
-            ScrollbarPointerDownAction::Page {
-                lane,
-                direction: lane.page_direction(),
-                distance: viewport_length,
-            }
+        ScrollbarAxisHit::LaneAfterThumb if snapshot.axis == Axis::Vertical => {
+            page_action(snapshot, LaneClick::AfterThumb)
         }
-        Some(ScrollbarAxisHit::LaneAfterThumb) if axis == Axis::Vertical => {
-            let lane = LaneClick::AfterThumb;
-            ScrollbarPointerDownAction::Page {
-                lane,
-                direction: lane.page_direction(),
-                distance: viewport_length,
-            }
-        }
-        Some(ScrollbarAxisHit::LaneBeforeThumb | ScrollbarAxisHit::LaneAfterThumb) | None => {
+        ScrollbarAxisHit::LaneBeforeThumb | ScrollbarAxisHit::LaneAfterThumb => {
             ScrollbarPointerDownAction::Ignore
         }
     }
 }
 
-/// Dispatches a pointer down through the interaction callbacks when appropriate.
+fn page_action(snapshot: ScrollbarGeometrySnapshot, lane: LaneClick) -> ScrollbarPointerDownAction {
+    ScrollbarPointerDownAction::Page {
+        snapshot,
+        lane,
+        direction: lane.page_direction(),
+        distance: snapshot.page_distance,
+    }
+}
+
+/// Dispatches a pointer down only while its entire snapshot remains current.
 pub fn dispatch_scrollbar_pointer_down(
-    axis: Axis,
+    state: &crate::ScrollbarState,
     style: ScrollbarStyle,
     interaction: &ScrollbarInteraction,
+    snapshot: ScrollbarGeometrySnapshot,
     pointer_position: Point<Pixels>,
 ) -> ScrollbarPointerDownAction {
-    let Some(state) = interaction.current_state() else {
+    if !state.has_current_owner(snapshot.owner) || !interaction.snapshot_is_current(snapshot, style)
+    {
         return ScrollbarPointerDownAction::Ignore;
-    };
-    let action = scrollbar_pointer_down_action(axis, style, state, pointer_position);
+    }
+    let action = scrollbar_pointer_down_action(snapshot, pointer_position);
     if let ScrollbarPointerDownAction::Page {
+        snapshot,
         direction,
         distance,
         ..
     } = action
     {
-        interaction.page_scroll(direction, distance);
+        if interaction.current_snapshot(snapshot.axis, style) != Some(snapshot)
+            || !state.has_current_owner(snapshot.owner)
+        {
+            return ScrollbarPointerDownAction::Ignore;
+        }
+        (interaction.page_scroll)(snapshot, direction, distance);
     }
     action
 }
 
-/// Maps an active thumb drag to a scroll offset without invoking callbacks.
+/// Maps a pointer position through one exact geometry snapshot.
 #[must_use]
 pub fn scrollbar_drag_scroll_offset(
-    axis: Axis,
-    style: ScrollbarStyle,
-    state: ScrollbarScrollState,
+    snapshot: ScrollbarGeometrySnapshot,
     pointer_position: Point<Pixels>,
     grab_offset: Pixels,
 ) -> Option<Pixels> {
-    let style = style.normalized();
-    let viewport_length = scrollbar_axis_length(axis, state.viewport_bounds.size);
-    let overflow_length = scrollbar_axis_max_offset(axis, state.max_offset);
-    let scroll_offset =
-        scrollbar_axis_scroll_offset(axis, state.scroll_offset).clamp(px(0.0), overflow_length);
-    let metrics = scrollbar_metrics(
-        style.geometry,
-        viewport_length,
-        overflow_length,
-        scroll_offset,
-    )?;
-    let pointer_axis_position =
-        scrollbar_axis_position_in_viewport(axis, pointer_position, state.viewport_bounds);
-    scroll_offset_from_thumb_drag(
-        style.geometry,
-        viewport_length,
-        overflow_length,
-        metrics,
-        pointer_axis_position,
-        grab_offset,
-    )
+    let thumb_length = snapshot.thumb_bounds.end - snapshot.thumb_bounds.start;
+    let track_length = snapshot.track_bounds.end - snapshot.track_bounds.start;
+    let thumb_travel = (track_length - thumb_length).max(px(0.0));
+    if thumb_travel <= px(0.0) {
+        return Some(px(0.0));
+    }
+    let desired_thumb_offset =
+        (snapshot.axis_position(pointer_position) - snapshot.track_bounds.start - grab_offset)
+            .clamp(px(0.0), thumb_travel);
+    Some(snapshot.overflow_length() * (desired_thumb_offset / thumb_travel))
 }
 
-/// Dispatches an active thumb drag through the interaction callbacks.
-pub fn dispatch_scrollbar_drag(
-    axis: Axis,
-    style: ScrollbarStyle,
+/// Dispatches a drag update under the current snapshot of one mounted owner.
+///
+/// The current snapshot is obtained and then compared again immediately before
+/// the mutation callback. A geometry change during either lookup rejects the
+/// update rather than mixing records.
+pub(crate) fn dispatch_scrollbar_drag(
+    snapshot: ScrollbarGeometrySnapshot,
     interaction: &ScrollbarInteraction,
-    pointer_position: Point<Pixels>,
-    grab_offset: Pixels,
-) -> Option<Pixels> {
-    let state = interaction.current_state()?;
-    let next_offset =
-        scrollbar_drag_scroll_offset(axis, style, state, pointer_position, grab_offset)?;
-    interaction.set_scroll_offset(next_offset);
-    Some(next_offset)
+    next_offset: Pixels,
+) -> Option<(ScrollbarGeometrySnapshot, Pixels)> {
+    (interaction.set_scroll_offset)(snapshot, next_offset);
+    Some((snapshot, next_offset))
 }
 
-pub(crate) fn scrollbar_axis_length(axis: Axis, size: Size<Pixels>) -> Pixels {
+fn axis_size(axis: Axis, size: gpui::Size<Pixels>) -> Pixels {
     match axis {
         Axis::Horizontal => size.width,
         Axis::Vertical => size.height,
     }
-}
-
-pub(crate) fn scrollbar_axis_max_offset(axis: Axis, max_offset: Size<Pixels>) -> Pixels {
-    match axis {
-        Axis::Horizontal => max_offset.width,
-        Axis::Vertical => max_offset.height,
-    }
     .max(px(0.0))
-}
-
-pub(crate) fn scrollbar_axis_scroll_offset(axis: Axis, scroll_offset: Point<Pixels>) -> Pixels {
-    match axis {
-        Axis::Horizontal => scroll_offset.x,
-        Axis::Vertical => scroll_offset.y,
-    }
-}
-
-pub(crate) fn scrollbar_axis_position_in_viewport(
-    axis: Axis,
-    position: Point<Pixels>,
-    viewport_bounds: Bounds<Pixels>,
-) -> Pixels {
-    match axis {
-        Axis::Horizontal => position.x - viewport_bounds.left(),
-        Axis::Vertical => position.y - viewport_bounds.top(),
-    }
 }

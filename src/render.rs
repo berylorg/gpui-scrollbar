@@ -1,84 +1,96 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::Cell, time::Instant};
 
 use gpui::{
     AnyElement, App, Context, ElementId, MouseButton, Pixels, Point, Render, ScrollHandle, Window,
     canvas, div, prelude::*, px, rgb,
 };
 
-use crate::interaction::{
-    ScrollbarInteraction, ScrollbarPointerDownAction, dispatch_scrollbar_drag,
-    dispatch_scrollbar_pointer_down, scrollbar_axis_length, scrollbar_axis_max_offset,
-    scrollbar_axis_scroll_offset,
+use crate::lifecycle::{ScrollbarDragInstance, ScrollbarRenderIdentity};
+use crate::{
+    Axis, ScrollbarGeometrySnapshot, ScrollbarInteraction, ScrollbarOwnerKey,
+    ScrollbarPointerDownAction, ScrollbarState, ScrollbarStyle, ScrollbarVisibilityKey,
+    ScrollbarVisibilityPolicy, dispatch_scrollbar_pointer_down,
 };
-use crate::{Axis, ScrollbarMetrics, ScrollbarStyle, ScrollbarVisibilityPolicy, scrollbar_metrics};
 
-/// Renders an interactive scrollbar backed by an ordinary [`ScrollHandle`].
+/// Renders an exact keyed interactive scrollbar backed by a [`ScrollHandle`].
 #[must_use]
 pub fn render_scroll_handle_scrollbar(
     id: impl Into<ElementId>,
+    owner: ScrollbarOwnerKey,
+    state: ScrollbarState,
     scroll_handle: &ScrollHandle,
     axis: Axis,
     style: ScrollbarStyle,
     visibility: ScrollbarVisibilityPolicy,
 ) -> Option<AnyElement> {
-    let interaction = ScrollbarInteraction::for_scroll_handle(scroll_handle.clone(), axis);
-    render_scrollbar(id, axis, style, visibility, interaction)
+    let interaction = ScrollbarInteraction::for_scroll_handle(owner, scroll_handle.clone(), axis);
+    render_scrollbar(id, state, axis, style, visibility, interaction)
 }
 
-/// Renders an interactive scrollbar backed by caller-owned scroll callbacks.
+/// Renders an exact keyed scrollbar backed by caller-owned callbacks.
 #[must_use]
 pub fn render_scrollbar(
     id: impl Into<ElementId>,
+    state: ScrollbarState,
     axis: Axis,
     style: ScrollbarStyle,
     visibility: ScrollbarVisibilityPolicy,
     interaction: ScrollbarInteraction,
 ) -> Option<AnyElement> {
     let style = style.normalized();
-    let state = interaction.current_state()?;
-    let viewport_length = scrollbar_axis_length(axis, state.viewport_bounds.size);
-    let overflow_length = scrollbar_axis_max_offset(axis, state.max_offset);
-    let scroll_offset =
-        scrollbar_axis_scroll_offset(axis, state.scroll_offset).clamp(px(0.0), overflow_length);
-    let metrics = scrollbar_metrics(
-        style.geometry,
-        viewport_length,
-        overflow_length,
-        scroll_offset,
-    )?;
-    let drives_animation_frames = visibility.should_request_animation_frame_for_overflow(true);
-    let opacity = match visibility.opacity_for_overflow(true) {
-        Some(opacity) => opacity,
-        None if drives_animation_frames => 0.0,
-        None => return None,
+    let Some(snapshot) = interaction.current_snapshot(axis, style) else {
+        state.retire_render_constructor();
+        return None;
     };
-
-    Some(render_scrollbar_with_metrics(
+    if !state.has_current_owner(snapshot.owner) {
+        state.retire_render_constructor();
+        return None;
+    }
+    let render_identity = state.claim_render_identity(snapshot, style, &interaction)?;
+    let frame_key = visibility.current_frame_key(snapshot.owner, true, Instant::now());
+    let opacity = match visibility.opacity_for_owner_at(snapshot.owner, true, Instant::now()) {
+        Some(opacity) => opacity,
+        None if frame_key.is_some() => 0.0,
+        None => {
+            state.retire_render_constructor();
+            return None;
+        }
+    };
+    Some(render_scrollbar_with_snapshot(
         id.into(),
-        axis,
-        metrics,
+        state,
+        render_identity,
+        snapshot,
         style,
         opacity,
-        drives_animation_frames,
+        frame_key,
         visibility,
         interaction,
     ))
 }
 
-fn render_scrollbar_with_metrics(
+fn render_scrollbar_with_snapshot(
     id: ElementId,
-    axis: Axis,
-    metrics: ScrollbarMetrics,
+    state: ScrollbarState,
+    render_identity: ScrollbarRenderIdentity,
+    snapshot: ScrollbarGeometrySnapshot,
     style: ScrollbarStyle,
     opacity: f32,
-    drives_animation_frames: bool,
+    frame_key: Option<ScrollbarVisibilityKey>,
     visibility: ScrollbarVisibilityPolicy,
     interaction: ScrollbarInteraction,
 ) -> AnyElement {
-    let pending_drag = Rc::new(RefCell::new(None));
-    let active_drag = Rc::new(RefCell::new(None));
-    let thumb = render_scrollbar_thumb(axis, metrics, style, opacity);
-    let mut lane = match axis {
+    let thumb = render_interactive_scrollbar_thumb(
+        (id.clone(), "thumb").into(),
+        state.clone(),
+        render_identity,
+        snapshot,
+        style,
+        opacity,
+        visibility.clone(),
+        interaction.clone(),
+    );
+    let mut lane = match snapshot.axis {
         Axis::Horizontal => div()
             .absolute()
             .left_0()
@@ -94,75 +106,38 @@ fn render_scrollbar_with_metrics(
     }
     .id(id)
     .child(thumb);
-    if drives_animation_frames {
-        lane = lane.child(render_animation_frame_driver(visibility.clone()));
+    if let Some(frame_key) = frame_key {
+        lane = lane.child(render_animation_frame_driver(visibility.clone(), frame_key));
     }
-
-    let drag_value = ScrollbarDragValue {
-        axis,
-        style,
-        interaction: interaction.clone(),
-        visibility: visibility.clone(),
-        pending_drag: pending_drag.clone(),
-        active_drag: active_drag.clone(),
-    };
-    lane = lane
-        .on_mouse_down(MouseButton::Left, {
-            let interaction = interaction.clone();
-            let visibility = visibility.clone();
-            let pending_drag = pending_drag.clone();
-            move |event, window, cx| {
-                handle_scrollbar_mouse_down(
-                    axis,
-                    style,
-                    &interaction,
-                    &visibility,
-                    &pending_drag,
-                    event.position,
-                    window,
-                    cx,
-                );
-                cx.stop_propagation();
-            }
-        })
-        .on_drag(drag_value, |drag: &ScrollbarDragValue, _, window, cx| {
-            drag.start(window, cx);
-            cx.new(|_| ScrollbarDragPreview)
-        })
-        .on_drag_move::<ScrollbarDragValue>(
-            move |event: &gpui::DragMoveEvent<ScrollbarDragValue>, window, cx| {
-                let (axis, style, interaction, visibility, active_drag) = {
-                    let drag = event.drag(cx);
-                    (
-                        drag.axis,
-                        drag.style,
-                        drag.interaction.clone(),
-                        drag.visibility.clone(),
-                        drag.active_drag.clone(),
-                    )
-                };
-                update_scrollbar_drag(
-                    axis,
-                    style,
-                    &interaction,
-                    &visibility,
-                    &active_drag,
-                    event.event.position,
-                    window,
-                    cx,
-                );
-                cx.stop_propagation();
-            },
-        );
-
+    lane = lane.on_mouse_down(MouseButton::Left, {
+        let state = state.clone();
+        let interaction = interaction.clone();
+        let visibility = visibility.clone();
+        move |event, window, cx| {
+            handle_lane_mouse_down(
+                &state,
+                snapshot,
+                style,
+                &interaction,
+                &visibility,
+                event.position,
+                window,
+                cx,
+            );
+            cx.stop_propagation();
+        }
+    });
     lane.into_any_element()
 }
 
-fn render_animation_frame_driver(visibility: ScrollbarVisibilityPolicy) -> AnyElement {
+fn render_animation_frame_driver(
+    visibility: ScrollbarVisibilityPolicy,
+    expected: ScrollbarVisibilityKey,
+) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            visibility.request_animation_frame_for_overflow(true, window);
+            visibility.request_animation_frame_for_key(expected, window);
         },
     )
     .absolute()
@@ -177,7 +152,7 @@ fn render_animation_frame_driver(visibility: ScrollbarVisibilityPolicy) -> AnyEl
 #[must_use]
 pub fn render_scrollbar_thumb(
     axis: Axis,
-    metrics: ScrollbarMetrics,
+    metrics: crate::ScrollbarMetrics,
     style: ScrollbarStyle,
     opacity: f32,
 ) -> AnyElement {
@@ -206,85 +181,173 @@ pub fn render_scrollbar_thumb(
     }
 }
 
-#[derive(Clone, Copy)]
-enum PendingScrollbarDrag {
-    Thumb { grab_offset: Pixels },
-    Ignore,
-}
-
-#[derive(Clone, Copy)]
-struct ScrollbarActiveDrag {
-    grab_offset: Pixels,
+#[allow(clippy::too_many_arguments)]
+fn render_interactive_scrollbar_thumb(
+    id: ElementId,
+    state: ScrollbarState,
+    render_identity: ScrollbarRenderIdentity,
+    snapshot: ScrollbarGeometrySnapshot,
+    style: ScrollbarStyle,
+    opacity: f32,
+    visibility: ScrollbarVisibilityPolicy,
+    interaction: ScrollbarInteraction,
+) -> AnyElement {
+    let style = style.normalized();
+    let metrics = snapshot.metrics();
+    let pending_instance = state.pending_drag_instance(render_identity);
+    let active_instance = state.active_drag_instance();
+    let drag_instance = state.next_drag_instance();
+    let thumb = match snapshot.axis {
+        Axis::Horizontal => div()
+            .absolute()
+            .left(style.geometry.track_inset + metrics.thumb_offset)
+            .bottom(style.geometry.track_inset)
+            .h(style.thickness)
+            .w(metrics.thumb_length),
+        Axis::Vertical => div()
+            .absolute()
+            .top(style.geometry.track_inset + metrics.thumb_offset)
+            .right(style.geometry.track_inset)
+            .w(style.thickness)
+            .h(metrics.thumb_length),
+    };
+    let drag_value = ScrollbarDragValue {
+        state: state.clone(),
+        render_identity,
+        pending_instance,
+        drag_instance,
+        snapshot,
+        interaction: interaction.clone(),
+        visibility: visibility.clone(),
+        owns_active_drag: Cell::new(false),
+    };
+    thumb
+        .id(id)
+        .rounded_full()
+        .bg(rgb(style.thumb_color))
+        .opacity(opacity)
+        .on_mouse_down(MouseButton::Left, {
+            let state = state.clone();
+            let interaction = interaction.clone();
+            move |event, _, cx| {
+                if let ScrollbarPointerDownAction::StartDrag {
+                    snapshot,
+                    grab_offset,
+                } = dispatch_scrollbar_pointer_down(
+                    &state,
+                    style,
+                    &interaction,
+                    snapshot,
+                    event.position,
+                ) {
+                    state.begin_pending_drag(
+                        render_identity,
+                        pending_instance,
+                        style,
+                        snapshot,
+                        grab_offset,
+                        &interaction,
+                    );
+                }
+                cx.stop_propagation();
+            }
+        })
+        .on_drag(drag_value, |drag: &ScrollbarDragValue, _, window, cx| {
+            if !drag.start(window, cx) {
+                window.defer(cx, |window, cx| {
+                    cx.stop_active_drag(window);
+                });
+            }
+            cx.new(|_| ScrollbarDragPreview)
+        })
+        .on_drag_move::<ScrollbarDragValue>(
+            move |event: &gpui::DragMoveEvent<ScrollbarDragValue>, window, cx| {
+                let (state, visibility, drag_instance) = {
+                    let drag = event.drag(cx);
+                    (
+                        drag.state.clone(),
+                        drag.visibility.clone(),
+                        drag.drag_instance,
+                    )
+                };
+                if let Some((current, _)) =
+                    state.update_drag_instance(drag_instance, event.event.position)
+                {
+                    state.owner_updated_instance(drag_instance, window, cx);
+                    visibility.record_direct_activity(current.owner, window, cx);
+                } else {
+                    cx.stop_active_drag(window);
+                }
+                cx.stop_propagation();
+            },
+        )
+        .on_mouse_up(MouseButton::Left, {
+            let state = state.clone();
+            let visibility = visibility.clone();
+            move |_, window, cx| {
+                finish_pointer_lifecycle(
+                    &state,
+                    &visibility,
+                    snapshot.owner,
+                    pending_instance,
+                    active_instance,
+                    window,
+                    cx,
+                );
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, {
+            let state = state.clone();
+            let visibility = visibility.clone();
+            move |_, window, cx| {
+                finish_pointer_lifecycle(
+                    &state,
+                    &visibility,
+                    snapshot.owner,
+                    pending_instance,
+                    active_instance,
+                    window,
+                    cx,
+                );
+            }
+        })
+        .into_any_element()
 }
 
 struct ScrollbarDragValue {
-    axis: Axis,
-    style: ScrollbarStyle,
+    state: ScrollbarState,
+    render_identity: ScrollbarRenderIdentity,
+    pending_instance: ScrollbarDragInstance,
+    drag_instance: ScrollbarDragInstance,
+    snapshot: ScrollbarGeometrySnapshot,
     interaction: ScrollbarInteraction,
     visibility: ScrollbarVisibilityPolicy,
-    pending_drag: Rc<RefCell<Option<PendingScrollbarDrag>>>,
-    active_drag: Rc<RefCell<Option<ScrollbarActiveDrag>>>,
+    owns_active_drag: Cell<bool>,
 }
 
 impl ScrollbarDragValue {
-    fn start(&self, window: &mut Window, cx: &mut App) {
-        let pending = self.pending_drag.borrow_mut().take();
-        let grab_offset = match pending {
-            Some(PendingScrollbarDrag::Thumb { grab_offset }) => Some(grab_offset),
-            Some(PendingScrollbarDrag::Ignore) => None,
-            None => self.thumb_grab_offset_at(window.mouse_position()),
-        };
-        let Some(grab_offset) = grab_offset else {
-            return;
-        };
-
-        self.interaction.drag_started();
-        *self.active_drag.borrow_mut() = Some(ScrollbarActiveDrag { grab_offset });
-        self.visibility.begin_direct_interaction(window, cx);
-    }
-
-    fn thumb_grab_offset_at(&self, pointer_position: Point<Pixels>) -> Option<Pixels> {
-        let state = self.interaction.current_state()?;
-        match crate::scrollbar_pointer_down_action(self.axis, self.style, state, pointer_position) {
-            ScrollbarPointerDownAction::StartDrag { grab_offset } => Some(grab_offset),
-            ScrollbarPointerDownAction::Page { .. } | ScrollbarPointerDownAction::Ignore => None,
+    fn start(&self, window: &mut Window, cx: &mut App) -> bool {
+        if self.state.start_pending_drag(
+            self.render_identity,
+            self.pending_instance,
+            self.drag_instance,
+            &self.interaction,
+        ) {
+            self.owns_active_drag.set(true);
+            self.visibility
+                .begin_direct_interaction(self.snapshot.owner, window, cx);
+            true
+        } else {
+            false
         }
     }
 }
 
 impl Drop for ScrollbarDragValue {
     fn drop(&mut self) {
-        if self.active_drag.borrow_mut().take().is_some() {
-            self.interaction.drag_ended();
-            self.visibility.end_direct_interaction();
+        if self.owns_active_drag.get() {
+            self.state.cancel_drag_instance(self.drag_instance);
         }
-    }
-}
-
-fn update_scrollbar_drag(
-    axis: Axis,
-    style: ScrollbarStyle,
-    interaction: &ScrollbarInteraction,
-    visibility: &ScrollbarVisibilityPolicy,
-    active_drag: &Rc<RefCell<Option<ScrollbarActiveDrag>>>,
-    pointer_position: Point<Pixels>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(active_drag) = *active_drag.borrow() else {
-        return;
-    };
-    if dispatch_scrollbar_drag(
-        axis,
-        style,
-        interaction,
-        pointer_position,
-        active_drag.grab_offset,
-    )
-    .is_some()
-    {
-        interaction.owner_updated(window, cx);
-        visibility.record_direct_activity(window, cx);
     }
 }
 
@@ -296,27 +359,45 @@ impl Render for ScrollbarDragPreview {
     }
 }
 
-fn handle_scrollbar_mouse_down(
-    axis: Axis,
+#[allow(clippy::too_many_arguments)]
+fn handle_lane_mouse_down(
+    state: &ScrollbarState,
+    snapshot: ScrollbarGeometrySnapshot,
     style: ScrollbarStyle,
     interaction: &ScrollbarInteraction,
     visibility: &ScrollbarVisibilityPolicy,
-    pending_drag: &Rc<RefCell<Option<PendingScrollbarDrag>>>,
     position: Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    match dispatch_scrollbar_pointer_down(axis, style, interaction, position) {
-        ScrollbarPointerDownAction::StartDrag { grab_offset } => {
-            *pending_drag.borrow_mut() = Some(PendingScrollbarDrag::Thumb { grab_offset });
+    match dispatch_scrollbar_pointer_down(state, style, interaction, snapshot, position) {
+        ScrollbarPointerDownAction::Page { snapshot, .. }
+            if state.has_current_owner(snapshot.owner) =>
+        {
+            interaction.owner_updated(snapshot, window, cx);
+            visibility.record_direct_activity(snapshot.owner, window, cx);
         }
-        ScrollbarPointerDownAction::Page { .. } => {
-            *pending_drag.borrow_mut() = Some(PendingScrollbarDrag::Ignore);
-            interaction.owner_updated(window, cx);
-            visibility.record_direct_activity(window, cx);
-        }
-        ScrollbarPointerDownAction::Ignore => {
-            *pending_drag.borrow_mut() = Some(PendingScrollbarDrag::Ignore);
-        }
+        ScrollbarPointerDownAction::StartDrag { .. }
+        | ScrollbarPointerDownAction::Page { .. }
+        | ScrollbarPointerDownAction::Ignore => {}
+    }
+}
+
+fn finish_pointer_lifecycle(
+    state: &ScrollbarState,
+    visibility: &ScrollbarVisibilityPolicy,
+    owner: ScrollbarOwnerKey,
+    pending_instance: ScrollbarDragInstance,
+    active_instance: Option<ScrollbarDragInstance>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    state.cancel_pending_drag(pending_instance);
+    let completion = match active_instance {
+        Some(active_instance) => state.settle_drag_instance(active_instance),
+        None => state.settle_drag_from_pending(Some(pending_instance)),
+    };
+    if completion.finishes_pointer() {
+        visibility.end_direct_interaction(owner, window, cx);
     }
 }
