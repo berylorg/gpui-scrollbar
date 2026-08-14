@@ -6,7 +6,9 @@ use std::{
 };
 
 use gpui::{Modifiers, MouseButton, ScrollHandle, point, px};
-use gpui_scrollbar::{Axis, ScrollbarState, ScrollbarStyle, scrollbar_geometry_snapshot};
+use gpui_scrollbar::{
+    Axis, ScrollbarInteraction, ScrollbarState, ScrollbarStyle, scrollbar_geometry_snapshot,
+};
 use support::{
     MountedScrollHandleView, MountedScrollbarView, has_active_drag, interaction, key,
     vertical_state,
@@ -297,6 +299,56 @@ fn mounted_vertical_lane_hold_never_installs_active_drag(cx: &mut gpui::TestAppC
 
     assert!(!has_active_drag(cx));
     assert_eq!(pages.borrow().len(), 1);
+}
+
+#[gpui::test]
+fn mounted_lane_page_owner_update_receives_fresh_geometry(cx: &mut gpui::TestAppContext) {
+    let owner = key(42, 1);
+    let style = ScrollbarStyle::default();
+    let current = Rc::new(Cell::new(vertical_state(owner, px(120.0))));
+    let updates = Rc::new(RefCell::new(Vec::new()));
+    let interaction = ScrollbarInteraction::new(
+        {
+            let current = current.clone();
+            move || Some(current.get())
+        },
+        |_, _| {},
+        {
+            let current = current.clone();
+            move |_, _, distance| {
+                let mut next = current.get();
+                next.scroll_offset.y += distance;
+                current.set(next);
+            }
+        },
+        |_| {},
+        |_| {},
+        {
+            let updates = updates.clone();
+            move |snapshot, _, _| updates.borrow_mut().push(snapshot)
+        },
+    );
+    let state = ScrollbarState::new(owner);
+    let before =
+        scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+    let (_, cx) = cx.add_window_view({
+        let state = state.clone();
+        move |_, _| MountedScrollbarView {
+            state,
+            interaction,
+            axis: Axis::Vertical,
+        }
+    });
+
+    cx.simulate_mouse_down(
+        point(px(236.0), before.thumb_bounds.end + px(1.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+
+    let after = scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+    assert_eq!(&*updates.borrow(), &[after]);
+    assert_ne!(after, before);
 }
 
 #[gpui::test]

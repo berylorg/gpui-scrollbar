@@ -132,6 +132,128 @@ fn stale_mount_generation_rejects_lane_without_callback() {
 }
 
 #[test]
+fn lane_page_returns_fresh_post_mutation_snapshot() {
+    let owner = key(8, 1);
+    let style = ScrollbarStyle::default();
+    let current = Rc::new(Cell::new(vertical_state(owner, px(120.0))));
+    let interaction = ScrollbarInteraction::new(
+        {
+            let current = current.clone();
+            move || Some(current.get())
+        },
+        |_, _| {},
+        {
+            let current = current.clone();
+            move |_, _, distance| {
+                let mut next = current.get();
+                next.scroll_offset.y += distance;
+                current.set(next);
+            }
+        },
+        |_| {},
+        |_| {},
+        |_, _, _| {},
+    );
+    let state = ScrollbarState::new(owner);
+    let before =
+        scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+
+    let result = dispatch_scrollbar_pointer_down(
+        &state,
+        style,
+        &interaction,
+        before,
+        point(px(236.0), before.thumb_bounds.end + px(1.0)),
+    );
+    let after = scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+
+    assert!(matches!(result, ScrollbarPointerDownAction::Page {
+        snapshot, direction: ScrollDirection::Forward, distance, ..
+    } if snapshot == after && snapshot != before && distance == before.page_distance));
+}
+
+#[test]
+fn lane_page_owner_change_suppresses_post_mutation_action() {
+    let owner = key(9, 1);
+    let replacement = key(9, 2);
+    let style = ScrollbarStyle::default();
+    let current = Rc::new(Cell::new(vertical_state(owner, px(120.0))));
+    let pages = Rc::new(Cell::new(0));
+    let interaction = ScrollbarInteraction::new(
+        {
+            let current = current.clone();
+            move || Some(current.get())
+        },
+        |_, _| {},
+        {
+            let current = current.clone();
+            let pages = pages.clone();
+            move |_, _, _| {
+                pages.set(pages.get() + 1);
+                current.set(vertical_state(replacement, px(0.0)));
+            }
+        },
+        |_| {},
+        |_| {},
+        |_, _, _| {},
+    );
+    let state = ScrollbarState::new(owner);
+    let snapshot =
+        scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+
+    assert_eq!(
+        dispatch_scrollbar_pointer_down(
+            &state,
+            style,
+            &interaction,
+            snapshot,
+            point(px(236.0), snapshot.thumb_bounds.end + px(1.0)),
+        ),
+        ScrollbarPointerDownAction::Ignore
+    );
+    assert_eq!(pages.get(), 1);
+}
+
+#[test]
+fn lane_page_loss_of_overflow_suppresses_post_mutation_action() {
+    let owner = key(10, 1);
+    let style = ScrollbarStyle::default();
+    let current = Rc::new(Cell::new(vertical_state(owner, px(120.0))));
+    let interaction = ScrollbarInteraction::new(
+        {
+            let current = current.clone();
+            move || Some(current.get())
+        },
+        |_, _| {},
+        {
+            let current = current.clone();
+            move |_, _, _| {
+                let mut next = current.get();
+                next.content_size = size(px(240.0), px(240.0));
+                current.set(next);
+            }
+        },
+        |_| {},
+        |_| {},
+        |_, _, _| {},
+    );
+    let state = ScrollbarState::new(owner);
+    let snapshot =
+        scrollbar_geometry_snapshot(Axis::Vertical, style.geometry, current.get()).unwrap();
+
+    assert_eq!(
+        dispatch_scrollbar_pointer_down(
+            &state,
+            style,
+            &interaction,
+            snapshot,
+            point(px(236.0), snapshot.thumb_bounds.end + px(1.0)),
+        ),
+        ScrollbarPointerDownAction::Ignore
+    );
+}
+
+#[test]
 fn horizontal_outside_thumb_dispatches_nothing() {
     let owner = key(1, 1);
     let style = ScrollbarStyle::default();

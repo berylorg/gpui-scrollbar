@@ -7,14 +7,15 @@ use crate::{
     ScrollbarOwnerKey, ScrollbarScrollState, ScrollbarStyle, scrollbar_geometry_snapshot,
 };
 
-/// Callback invoked after keyed scrollbar chrome mutated caller-owned state.
+/// Callback invoked after keyed scrollbar chrome revalidates caller-owned state.
 pub type ScrollbarOwnerUpdateCallback =
     Rc<dyn Fn(ScrollbarGeometrySnapshot, &mut Window, &mut App)>;
 
 /// Caller-owned scroll callbacks used by rendered scrollbar chrome.
 ///
-/// Every mutation callback receives the exact geometry snapshot validated
-/// immediately before it was invoked.
+/// Scroll mutations receive the exact geometry snapshot validated immediately
+/// before they are invoked. Owner updates receive a newly revalidated current
+/// snapshot after that mutation.
 #[derive(Clone)]
 pub struct ScrollbarInteraction {
     identity: ScrollbarInteractionIdentity,
@@ -270,6 +271,10 @@ fn page_action(snapshot: ScrollbarGeometrySnapshot, lane: LaneClick) -> Scrollba
 }
 
 /// Dispatches a pointer down only while its entire snapshot remains current.
+///
+/// A page request uses the hit-tested snapshot for its mutation, then obtains a
+/// fresh current snapshot before returning the action used for the owner update.
+/// This keeps the owner callback from observing pre-page geometry.
 pub fn dispatch_scrollbar_pointer_down(
     state: &crate::ScrollbarState,
     style: ScrollbarStyle,
@@ -284,6 +289,7 @@ pub fn dispatch_scrollbar_pointer_down(
     let action = scrollbar_pointer_down_action(snapshot, pointer_position);
     if let ScrollbarPointerDownAction::Page {
         snapshot,
+        lane,
         direction,
         distance,
         ..
@@ -295,6 +301,18 @@ pub fn dispatch_scrollbar_pointer_down(
             return ScrollbarPointerDownAction::Ignore;
         }
         (interaction.page_scroll)(snapshot, direction, distance);
+        let Some(current) = interaction.current_owner_update(snapshot, style) else {
+            return ScrollbarPointerDownAction::Ignore;
+        };
+        if !state.has_current_owner(current.owner) {
+            return ScrollbarPointerDownAction::Ignore;
+        }
+        return ScrollbarPointerDownAction::Page {
+            snapshot: current,
+            lane,
+            direction,
+            distance,
+        };
     }
     action
 }
