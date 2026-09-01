@@ -64,3 +64,9 @@ The crate exists so reusable `gpui` projects can share scrollbar geometry, rende
 - Recreated scroll-handle adapters compare the actual retained handle allocation through GPUI's opaque pointer-equality query. Clones of one handle preserve interaction continuity, while separately constructed equal-state handles invalidate a retained press.
 - Drag start, drag update, drag end, and lane-click activity update managed visibility state and are surfaced through caller-provided callbacks where the caller needs to update scroll intent state.
 - Callback-based scrolling is the only path for mutating scroll position, so caller-owned viewport semantics remain authoritative.
+
+# Engineering Rigor
+
+Profile: `production-application/v1`
+
+Modifiers: none
