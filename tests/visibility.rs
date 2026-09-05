@@ -46,8 +46,8 @@ impl Render for ObsoleteFrameDriverView {
             ScrollbarStyle::default(),
             self.visibility.clone(),
             self.interaction.clone(),
-        )
-        .expect("active fade renders its animation-frame driver");
+        );
+        assert_eq!(scrollbar.is_some(), self.obsolete_during_render);
         if self.obsolete_during_render {
             self.obsolete_during_render = false;
             assert!(
@@ -55,7 +55,7 @@ impl Render for ObsoleteFrameDriverView {
                     .replace_owner(self.owner, self.replacement, window, cx)
             );
         }
-        div().w(px(240.0)).h(px(240.0)).child(scrollbar)
+        div().w(px(240.0)).h(px(240.0)).children(scrollbar)
     }
 }
 
@@ -333,6 +333,10 @@ fn mounted_render_frame_driver_cannot_resurrect_obsolete_visibility(cx: &mut gpu
         |_, _, _| {},
     );
     let renders = Rc::new(Cell::new(0));
+    #[cfg(feature = "test-support")]
+    let probe = gpui_scrollbar::test_support::FrameDriverProbe::default();
+    #[cfg(feature = "test-support")]
+    let visibility = visibility.with_frame_driver_probe(probe.clone());
     let (_, cx) = cx.add_window_view({
         let state = state.clone();
         let renders = renders.clone();
@@ -351,15 +355,94 @@ fn mounted_render_frame_driver_cannot_resurrect_obsolete_visibility(cx: &mut gpu
 
     assert_ne!(replacement_key, stale);
     assert_eq!(replacement_key.owner, replacement);
+    assert!(replacement_key.sequence > stale.sequence);
     let renders_after_obsolete_driver = renders.get();
-    assert_eq!(renders_after_obsolete_driver, 1);
+    assert!(renders_after_obsolete_driver >= 1);
     cx.run_until_parked();
 
     assert_eq!(updates.get(), 0);
     assert_eq!(renders.get(), renders_after_obsolete_driver);
     assert_eq!(state.visibility_key(), Some(replacement_key));
+    #[cfg(feature = "test-support")]
+    assert_eq!(
+        probe.snapshot(),
+        gpui_scrollbar::test_support::FrameDriverSnapshot {
+            driver_calls: 1,
+            last_driver_key: Some(stale),
+            frame_requests: 0,
+            last_requested_key: None,
+        }
+    );
     assert_eq!(
         visibility.opacity_for_owner_at(replacement, true, Instant::now()),
         None
     );
+}
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn mounted_current_frame_driver_records_actual_frame_admission(cx: &mut gpui::TestAppContext) {
+    struct CurrentFrameDriverView {
+        state: ScrollbarState,
+        visibility: ScrollbarVisibilityPolicy,
+        interaction: ScrollbarInteraction,
+    }
+
+    impl Render for CurrentFrameDriverView {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div().w(px(240.0)).h(px(240.0)).child(
+                render_scrollbar(
+                    "current-frame-driver",
+                    self.state.clone(),
+                    Axis::Vertical,
+                    ScrollbarStyle::default(),
+                    self.visibility.clone(),
+                    self.interaction.clone(),
+                )
+                .expect("current fade renders its animation-frame driver"),
+            )
+        }
+    }
+
+    let owner = key(43, 1);
+    let state = ScrollbarState::new(owner);
+    let current = state.record_activity_at(owner, Instant::now()).unwrap();
+    let probe = gpui_scrollbar::test_support::FrameDriverProbe::default();
+    let visibility = state
+        .managed_with_config(
+            ScrollbarFadeConfig {
+                fade_delay: Duration::from_secs(60),
+                fade_duration: Duration::from_secs(60),
+            },
+            Rc::new(|_, _, _| {}),
+        )
+        .with_frame_driver_probe(probe.clone());
+    let interaction = ScrollbarInteraction::new(
+        move || {
+            Some(ScrollbarScrollState {
+                owner,
+                viewport_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(240.0), px(240.0))),
+                content_size: size(px(240.0), px(480.0)),
+                scroll_offset: point(px(0.0), px(120.0)),
+                page_distance: size(px(240.0), px(180.0)),
+            })
+        },
+        |_, _| {},
+        |_, _, _| {},
+        |_| {},
+        |_| {},
+        |_, _, _| {},
+    );
+    let (_, cx) = cx.add_window_view(move |_, _| CurrentFrameDriverView {
+        state,
+        visibility,
+        interaction,
+    });
+    cx.run_until_parked();
+
+    let snapshot = probe.snapshot();
+    assert!(snapshot.driver_calls > 0);
+    assert_eq!(snapshot.last_driver_key, Some(current));
+    assert_eq!(snapshot.frame_requests, snapshot.driver_calls);
+    assert_eq!(snapshot.last_requested_key, Some(current));
 }

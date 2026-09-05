@@ -65,6 +65,19 @@ The crate exists so reusable `gpui` projects can share scrollbar geometry, rende
 - Drag start, drag update, drag end, and lane-click activity update managed visibility state and are surfaced through caller-provided callbacks where the caller needs to update scroll intent state.
 - Callback-based scrolling is the only path for mutating scroll position, so caller-owned viewport semantics remain authoritative.
 
+## Frame-Driver Test Observation
+
+The opt-in `test-support` feature exposes a bounded `FrameDriverProbe` attached to one managed
+visibility policy with `with_frame_driver_probe`. Policy clones share its observation. It retains
+only driver-call and actual GPUI frame-request counts plus each path's latest exact visibility key;
+it does not retain callbacks, windows, scrollbar state, or an event history. Attaching it to a
+non-managed policy is a test setup error. The observer neither recomputes admission nor changes
+visibility or scheduling behavior and is absent from default builds.
+
+Mounted lifecycle evidence must distinguish ordinary activation redraws from frame requests. The
+obsolete-driver case verifies actual driver execution and no admitted request for its retired key;
+a current-key control verifies that the same observation records real frame requests.
+
 # Engineering Rigor
 
 Profile: `production-application/v1`

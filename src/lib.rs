@@ -67,6 +67,8 @@ mod lifecycle_drag;
 mod owner;
 mod render;
 mod style;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod visibility;
 mod visibility_state;
 

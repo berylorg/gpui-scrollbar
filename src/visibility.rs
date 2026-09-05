@@ -30,7 +30,27 @@ impl ScrollbarVisibilityPolicy {
             state,
             config,
             on_update,
+            #[cfg(feature = "test-support")]
+            frame_driver_probe: None,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn with_frame_driver_probe(mut self, probe: crate::test_support::FrameDriverProbe) -> Self {
+        let Self::Managed(managed) = &mut self else {
+            panic!("frame-driver probes require managed visibility");
+        };
+        managed.frame_driver_probe = Some(probe);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_frame_driver(&self, expected: ScrollbarVisibilityKey) {
+        if let Self::Managed(managed) = self
+            && let Some(probe) = &managed.frame_driver_probe
+        {
+            probe.record_driver(expected);
+        }
     }
 
     /// Creates a policy fully visible whenever geometry overflows.
@@ -119,6 +139,10 @@ impl ScrollbarVisibilityPolicy {
                 .is_animating_at(Instant::now(), managed.config)
         {
             window.request_animation_frame();
+            #[cfg(feature = "test-support")]
+            if let Some(probe) = &managed.frame_driver_probe {
+                probe.record_request(expected);
+            }
             true
         } else {
             false
@@ -241,6 +265,8 @@ pub struct ManagedScrollbarVisibility {
     state: ScrollbarState,
     config: ScrollbarFadeConfig,
     on_update: ScrollbarVisibilityUpdateCallback,
+    #[cfg(feature = "test-support")]
+    frame_driver_probe: Option<crate::test_support::FrameDriverProbe>,
 }
 
 impl ScrollbarState {

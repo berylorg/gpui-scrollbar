@@ -26,5 +26,8 @@ path = "src/lib.rs"
 [dependencies]
 gpui.workspace = true
 
+[features]
+test-support = []
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

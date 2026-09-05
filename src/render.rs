@@ -137,6 +137,8 @@ fn render_animation_frame_driver(
     canvas(
         |_, _, _| (),
         move |_, _, window, _| {
+            #[cfg(feature = "test-support")]
+            visibility.record_frame_driver(expected);
             visibility.request_animation_frame_for_key(expected, window);
         },
     )
