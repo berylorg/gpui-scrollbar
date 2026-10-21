@@ -8,7 +8,7 @@ rust-version = "1.92"
 version = "0.1.0"
 
 [workspace.dependencies]
-gpui = { git = "https://github.com/berylorg/zed-fork.git", rev = "3210d6ad35f90a3d13d705b836e84ae206b3d656", default-features = false, features = ["windows-manifest"] }
+gpui = { git = "https://github.com/berylorg/zed-fork.git", rev = "93f0584c01b6b4fd09409d0e1ee502535c020b5b", default-features = false, features = ["windows-manifest"] }
 
 [package]
 name = "gpui-scrollbar"
